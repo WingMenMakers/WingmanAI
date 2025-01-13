@@ -1,2 +1,2 @@
-# Personal-AI
+# Wingman
 Personal AI assistant using AI agents
