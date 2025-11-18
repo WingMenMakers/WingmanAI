@@ -6,6 +6,9 @@ pip install -r requirements.txt
 Once the libraries are installed, run the login.py file to kind of create a new account and store your access tokens in the users.json file.
 Then run the main.py file to start and get running the main app. (Note: it temporarily asks you for your email to login, since it is not connected to the database)
 
+Place client_secret.json inside config/ folder.
+This file is NOT included in the repo for security reasons.
+
 Here, the main.py file is supposed to: 
     First run the token_manager.py file in order to get the users' credentials and get the APIs working.
         This uses the functions from the Google_auth.py and linkedin_auth.py files to validate the apps. 
