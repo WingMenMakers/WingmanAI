@@ -8,6 +8,7 @@ Then run the main.py file to start and get running the main app. (Note: it tempo
 
 Place client_secret.json inside config/ folder.
 This file is NOT included in the repo for security reasons.
+Also create a data directory for users.json file.
 
 Here, the main.py file is supposed to: 
     First run the token_manager.py file in order to get the users' credentials and get the APIs working.
