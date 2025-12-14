@@ -1,41 +1,35 @@
 import os
 import json
+import logging
 from openai import OpenAI
 from dotenv import load_dotenv
-from Tools.LinkedinTool import LinkedInTool # NEW Import
-from google.oauth2.credentials import Credentials as GoogleCredentials # Import GoogleCredentials for type hint
-# NEW Imports for scheduling logic (needed later for schedule_post)
-import schedule
-import time 
-from datetime import datetime
+from Tools.LinkedinTool import LinkedInTool, LinkedInToolError # Import Tool and Error
 from typing import Dict, Any 
-import sys
-import re
+import re 
+from datetime import datetime, time as dt_time # Renaming time to dt_time to avoid conflict
 
 load_dotenv()
 
 class LinkedinAgent:
-    # 1. CRITICAL: Standardized __init__ signature
-    # We expect the Director to pass the LinkedIn token/ID in this 'credentials' dict
+    
     def __init__(self, credentials: Dict[str, Any]): 
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        self.available = False
         
-        # 2. CRITICAL: Extract LinkedIn credentials from the 'credentials' dict
-        # We assume the Director/Token Manager has structured this dict after auth
+        # 1. CRITICAL: Extract LinkedIn credentials and instantiate Tool
         access_token = credentials.get("access_token")
         user_id = credentials.get("user_id")
         
-        # 3. Instantiate the Tool with the LinkedIn credentials
         try:
             self.linkedin_tool = LinkedInTool(access_token, user_id)
+            self.available = True
         except ValueError as e:
-            # Handle case where Director/TokenManager failed to provide necessary tokens
-            self.available = False
-            print(f"❌ LinkedIn Agent not initialized: {e}")
-            return
-            
-        self.available = True
+            logging.error(f"LinkedIn Agent initialization failed: {e}")
+        except Exception as e:
+            logging.error(f"LinkedIn Tool initialization failed: {e}")
 
+    # -------------------- Internal Task Parsing --------------------
+    
     def _analyze_query_to_json(self, user_query):
         """Ask the LLM to parse the user query into a structured LinkedIn action."""
         agent_prompt = (
@@ -44,134 +38,144 @@ class LinkedinAgent:
 - "generate": Generate a LinkedIn post from a topic. Required keys: "action", "topic"
 - "post": Post the given content now. Required keys: "action", "content"
 - "generate_and_post": Generate from topic and post immediately. Required keys: "action", "topic"
-- "generate_and_schedule": Generate from topic and schedule a post. Required keys: "action", "topic", "time"
 - "schedule": Schedule existing content. Required keys: "action", "content", "time"
+- "generate_and_schedule": Generate from topic and schedule a post. Required keys: "action", "topic", "time"
 
-The "time" key must be in "HH:MM" 24-hour format (e.g., "15:30").
-Only return a valid JSON object. Do not explain.
+The "time" key must be a clear, unambiguous time string (e.g., "15:30" or "tomorrow at 10 AM"). If time is ambiguous or missing for schedule actions, use the placeholder 'MISSING_TIME'.
 """
         )
         try:
             response = self.client.chat.completions.create(
                 model="gpt-4o-mini",
-                messages=[
-                    {"role": "system", "content": agent_prompt},
-                    {"role": "user", "content": user_query}
-                ]
+                messages=[{"role": "system", "content": agent_prompt}, {"role": "user", "content": user_query}],
+                response_format={"type": "json_object"}
             )
-
-            content = response.choices[0].message.content.strip()
-            # Clean and parse JSON
-            if content.startswith("```json"):
-                content = content.replace("```json", "").strip()
-            if content.endswith("```"):
-                content = content[:-3].strip()
-            
+            content = response.choices[0].message.content.strip().replace("```json", "").replace("```", "").strip()
             return json.loads(content)
         except Exception:
-            return {"error": "Invalid format returned by model."}
+            return {"error": "JSON_PARSE_ERROR"}
+        
+    # -------------------- NEW: Internal Post Generation --------------------
 
-
-    def is_valid_time_format(self, t):
-        return re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", t) is not None
-
-    def pad_time_format(self, t):
-        parts = t.strip().split(":")
-        if len(parts) == 2:
-            return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00"
-        elif len(parts) == 3:
-            return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
-        return t
-
-    def schedule_post(self, post_content, post_time):
-        """Schedule the post at the specified time."""
-        post_time = self.pad_time_format(post_time)
-
-        if not self.is_valid_time_format(post_time):
-            print("❌ Invalid time format. Please use HH:MM or HH:MM:SS (24h format).")
-            return f"❌ Scheduling failed: Invalid time format {post_time}."
-
-        def job():
-            print(f"\n🕒 Time Reached: {datetime.now().strftime('%H:%M:%S')}")
-            print("🚀 Posting now...")
-            result = self.post_to_linkedin(post_content)
-            print(result)
-            
-            # CRITICAL: Stop the scheduling loop once the job is done
-            sys.exit(0) 
-
+    def _generate_post_content(self, topic: str) -> str:
+        """Generate a professional LinkedIn post using the OpenAI client."""
         try:
-            schedule.every().day.at(post_time).do(job)
-            return f"📅 Post scheduled for {post_time}. This process must remain running until posting time."
-        except schedule.ScheduleValueError as e:
-            return f"❌ Schedule Error: {e}"
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a professional LinkedIn content writer. Be inspiring, concise, and add emojis and 3-5 relevant hashtags. Return ONLY the post text."},
+                    {"role": "user", "content": f"Write an engaging LinkedIn post about my project: {topic}"}
+                ],
+                temperature=0.7
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            raise Exception(f"Post generation failed: {str(e)}")
         
+    # -------------------- CRITICAL FIX: Scheduling Handler --------------------
+    
+    def _handle_schedule(self, content: str, time_str: str) -> str:
+        """
+        Handles scheduling. Since we cannot run a blocking loop, we return a RAW 
+        schedule confirmation for the Director to handle conversationally.
+        """
+        if not content:
+            return "Agent Error: MISSING_DATA_LINKEDIN_CONTENT; Action: schedule"
         
-    def handle_query(self, user_query):
-        """Main handler to interpret user input and perform actions."""
-        print("🧠 LinkedIn Agent received a query...")
+        # We need a robust time string (e.g., "15:30" or "tomorrow at 10 AM")
+        if time_str in ["MISSING_TIME", None]:
+            return "Agent Error: MISSING_DATA_LINKEDIN_TIME; Action: schedule"
+        
+        # 🎯 Success: Return RAW status with the content and time (no actual scheduling here)
+        # The user must be informed that the current architecture requires an external scheduler.
+        return f"RAW_STATUS: SCHEDULE_CONFIRMED; Content: {content}; Time: {time_str}"
+
+    # -------------------- Main Contract Function --------------------
+
+    def handle_query(self, query: str, context: Any = None) -> Dict[str, Any]:
+        """
+        Main handler to interpret user input and perform actions.
+        Returns the unified structured dictionary: {"status": str, "action": str, "context": Any}.
+        """
+        action = "unknown"
 
         if not self.available:
-            return "❌ LinkedIn service is unavailable due to missing credentials."
+            context_error = "Agent Error: TOOL_UNAVAILABLE; LinkedIn service is unavailable due to missing credentials."
+            return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
             
-        task = self._analyze_query_to_json(user_query)
+        task = self._analyze_query_to_json(query)
+        action = task.get("action", "parse_fail")
 
         if "error" in task:
-            return f"Error analyzing request: {task['error']}"
+            context_error = f"Agent Error: PARSE_ERROR; {task['error']}"
+            return {"status": "FATAL_ERROR: PARSE_ERROR", "action": action, "context": context_error}
 
-        action = task.get("action")
         topic = task.get("topic")
-        post_content = task.get("content")
-        post_time = task.get("time")
+        content = task.get("content")
+        time_str = task.get("time")
 
-        # --- Action Execution Logic ---
-        if action == "generate":
-            generated = self.generate_post_content(topic)
-            # Since this is a head-less agent called by the Director, 
-            # we should return the suggested post and ask the user to confirm/schedule in the main loop
-            return f"Suggested Post (Ready for scheduling/posting):\n\n---\n{generated}\n\n---"
-            
-        elif action == "post":
-            return self.post_to_linkedin(post_content)
-            
-        elif action == "generate_and_post":
-            generated = self.generate_post_content(topic)
-            return self.post_to_linkedin(generated)
-            
-        elif action == "generate_and_schedule":
-            generated = self.generate_post_content(topic)
-            return self.schedule_post(generated, post_time)
-            
-        elif action == "schedule":
-            return self.schedule_post(post_content, post_time)
-            
-        else:
-            return f"Unknown action: {action}"
-        
-    def generate_post_content(self, topic):
-        """Generate a professional LinkedIn post using the OpenAI client."""
-        response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a professional LinkedIn content writer. Be inspiring, concise, and add emojis and 3-5 relevant hashtags."},
-                {"role": "user", "content": f"Write an engaging LinkedIn post about my project: {topic}"}
-            ],
-            temperature=0.7
-        )
-        return response.choices[0].message.content.strip()
+        try:
+            # 1. Execute action logic (all branches return a raw string)
+            if action == "generate":
+                generated_content = self._generate_post_content(topic)
+                raw_response = f"RAW_DATA: GENERATED_CONTENT; Content: {generated_content}"
+                
+            elif action == "post":
+                if not content:
+                    raw_response = "Agent Error: MISSING_DATA_LINKEDIN_CONTENT; Action: post"
+                else:
+                    self.linkedin_tool.post_content(content) # Tool raises exception on failure
+                    raw_response = "RAW_STATUS: POST_PUBLISHED; Content: Success"
+                
+            elif action == "generate_and_post":
+                generated_content = self._generate_post_content(topic)
+                self.linkedin_tool.post_content(generated_content)
+                raw_response = f"RAW_STATUS: POST_PUBLISHED; Content: {generated_content[:50]}..."
+                
+            elif action == "schedule":
+                # CRITICAL: Calls the non-blocking scheduler handler
+                raw_response = self._handle_schedule(content, time_str)
+                
+            elif action == "generate_and_schedule":
+                generated_content = self._generate_post_content(topic)
+                raw_response = self._handle_schedule(generated_content, time_str)
+                
+            else:
+                raw_response = f"Agent Error: UNKNOWN_ACTION; Action '{action}' not supported."
 
-    # 4. CRITICAL: Update API call to use the Tool
-    def post_to_linkedin(self, content):
-        """Post content directly to LinkedIn using the Tool."""
-        return self.linkedin_tool.post_content(content)
-        
-    # 5. Handle Query and Action (This logic is mostly fine, but should check availability)
-    def handle_query(self, user_query):
-        if not self.available:
-            return "❌ LinkedIn service is unavailable due to missing credentials."
+            # 2. Final Output Mapping (Specific-to-General If/Elif)
             
-        # ... (Rest of handle_query logic remains the same, but remove the old
-        # post_to_linkedin helper functions and API calls)
+            # Specific Recoverable Errors (INCOMPLETE status)
+            if raw_response.startswith("Agent Error: MISSING_DATA_LINKEDIN_CONTENT") or \
+               raw_response.startswith("Agent Error: MISSING_DATA_LINKEDIN_TIME"):
+                return {"status": "INCOMPLETE: MISSING_DATA", "action": action, "context": raw_response}
+            
+            # Fatal Errors (System failure, API failure)
+            elif raw_response.startswith("Agent Error:"):
+                return {"status": "FATAL_ERROR: AGENT_FAIL", "action": action, "context": raw_response}
+            
+            # Successful RAW Status/Data
+            elif raw_response.startswith("RAW_STATUS:") or raw_response.startswith("RAW_DATA:"):
+                return {"status": "COMPLETE: RAW_DATA", "action": action, "context": raw_response}
+            
+            # Catch-all for unexpected output
+            return {"status": "COMPLETE: RAW_DATA", "action": action, "context": raw_response}
+
+        except LinkedInToolError as e:
+            context_error = f"Agent Error: LINKEDIN_API_FAILURE; Reason: {e}"
+            return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
+            
+        except Exception as e:
+            context_error = f"Agent Error: SYSTEM_EXECUTION_ERROR; Reason: {str(e)}"
+            return {"status": "FATAL_ERROR: SYSTEM_EXECUTION", "action": action, "context": context_error}
         
-        # NOTE: The scheduling logic in schedule_post is tightly coupled to the main script.
-        # This is generally problematic in an interactive assistant, but for now, we leave it.
+    # def is_valid_time_format(self, t):
+    #     return re.fullmatch(r"\d{2}:\d{2}(:\d{2})?", t) is not None
+
+    # def pad_time_format(self, t):
+    #     parts = t.strip().split(":")
+    #     if len(parts) == 2:
+    #         return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:00"
+    #     elif len(parts) == 3:
+    #         return f"{parts[0].zfill(2)}:{parts[1].zfill(2)}:{parts[2].zfill(2)}"
+    #     return t

@@ -1,29 +1,25 @@
 import os
 import json
+import logging
 from dotenv import load_dotenv
 from openai import OpenAI
 from google.oauth2.credentials import Credentials
-from Tools.DocTool import DocAPI
-from auth import token_manager  # 🔹 new import
+from Tools.DocTool import DocTool, DocToolError
+from typing import Dict, Any, Optional
 
 load_dotenv()
 
 class DocAgent:
-    # The REQUIRED_SCOPE is now checked by the Director, but we keep it for reference
-    # and potential use in error messages.
     REQUIRED_SCOPE = "https://www.googleapis.com/auth/documents"
 
-    # 1. CRITICAL: Accept credentials object
-    def __init__(self, credentials: Credentials):        
-        self.credentials = credentials # Store locally
+    def __init__(self, credentials: Credentials):
+        self.credentials = credentials
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        # 2. CRITICAL: Pass credentials to the Tool
-        self.DocTool = DocAPI(credentials=credentials)
-        # 3. REMOVE the redundant scope check in the Agent
-        # The Director only initializes this agent IF the scope is granted.
-        self.available = True # If init succeeds, it's available.
+        self.DocTool = DocTool(credentials=credentials)
+        self.available = True
 
-    # 4. CRITICAL: Rename the analysis method
+    # -------------------- Internal Task Parsing --------------------
+
     def _analyze_query_to_json(self, user_query):
         """Ask ChatGPT to convert natural language into structured JSON commands."""
         system_prompt = (
@@ -69,127 +65,273 @@ Examples of user queries and corresponding outputs:
 
 If a query lacks enough detail, ask for clarification by responding with a JSON object:
 `{ "error": "Missing [field_name]. Please provide more information." }'
-
-Except if a file name is not found leave the file_name field empty.
+Except if a file name is not found leave the file_name field empty or use a placeholder like 'MISSING_FILE_NAME'."
 """
         )
         
-        response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_query}
-            ]
-        )
-        content = response.choices[0].message.content
-        if content.startswith("```json"):
-            content = content.replace("```json", "").strip()
-        if content.endswith("```"):
-            content = content[:-3].strip()
         try:
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_query}],
+                response_format={"type": "json_object"}
+            ).choices[0].message.content
+            
+            # Simplified JSON cleaning/loading
+            content = content.replace("```json", "").replace("```", "").strip()
             return json.loads(content)
-        except json.JSONDecodeError:
-            return {"error": "⚠ Invalid response format."}
+        except Exception as e:
+            logging.error(f"DocAgent parse error: {e}")
+            return {"error": "JSON_PARSE_ERROR"}
 
-    # 5. Standardized handle_query method
-    def handle_query(self, user_query):
-        print("Docs Agent has received the query...")
-        task = self._analyze_query_to_json(user_query) # Use renamed function
-        print("Task:", task)
-        response = self.handle_action(task)
-        return response
+    # -------------------- NEW: Internal Ambiguity Resolver --------------------
 
-    def get_doc_name(self, file):
-        """Try to resolve an ambiguous or partial file name."""
-        ten_docs = self.DocTool.get_recent_google_docs()
-        doc_names = [doc["name"] for doc in ten_docs]
-        if file in doc_names:
-            return file
-        doc_list_str = "\n".join([f"- {doc['name']}" for doc in ten_docs])
-        response = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Only reply with the name of the best-matching document from the list."},
-                {"role": "user", "content": f"Here are some recent documents:\n{doc_list_str}"},
-                {"role": "user", "content": f"The user is referring to: {file}"}
-            ]
-        )
-        return response.choices[0].message.content
-
-    def handle_action(self, response_data):
-        """Core logic to execute the parsed action."""
-        action = response_data.get("action")
-        file_name = response_data.get("file_name", "Untitled Document")
-
+    def _resolve_file_ambiguity(self, ambiguous_name: str) -> str:
+        """
+        Tries to resolve an ambiguous or partial file name using the LLM against recent docs.
+        Returns: The exact resolved file name (str) OR a structured Agent Error string.
+        """
         try:
-            # CREATE
-            if action == "create":
-                content = response_data.get("initial_content", "")
-                doc_id, link = self.DocTool.create_google_doc(title=file_name)
-                if content:
-                    self.DocTool.add_to_google_doc(doc_id, content, location="end")
-                return f"Successfully created file {file_name}, with Doc_Id: {doc_id}!\nTo access click{link}"
-                #return {"status": "success", "doc_id": doc_id, "message": f"📄 Created '{file_name}'", "link": link}
+            ten_docs = self.DocTool.get_recent_google_docs()
+            doc_names = [doc["name"] for doc in ten_docs]
+            
+            # Quick check for exact match or early exit
+            if ambiguous_name in doc_names:
+                 return ambiguous_name
+            if not ten_docs:
+                 return f"Agent Error: FILE_NOT_FOUND; Target: {ambiguous_name}; Reason: No recent files available."
 
-            # RETRIEVE
-            elif action == "retrieve":
-                doc_name = self.get_doc_name(file_name)
-                doc_id = self.DocTool.resolve_file_name_to_id(doc_name)
-                content = self.DocTool.get_google_doc_content(doc_id)
-                return f"Successfully Retrieved {doc_name}! Content:-\n{content}"
-                #return {"status": "success", "message": f"📄 Retrieved '{doc_name}'", "content": content}
+            doc_list_str = "\n".join([f"- {doc['name']}" for doc in ten_docs])
+            
+            # Use LLM for deterministic fuzzy matching (Smart-Headless logic)
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a deterministic file resolver. Given the user's ambiguous target, find the EXACT NAME of the best-matching document from the list. If there is ANY ambiguity or no clear match, return ONLY the specific phrase 'AMBIGUOUS_MATCH'."},
+                    {"role": "user", "content": f"Recent documents:\n{doc_list_str}\n\nThe user is referring to the document named: '{ambiguous_name}'"}
+                ],
+                temperature=0.1
+            ).choices[0].message.content.strip()
 
-            # ADD TEXT
-            elif action == "add_text":
-                doc_name = self.get_doc_name(file_name)
-                doc_id = self.DocTool.resolve_file_name_to_id(doc_name)
-                self.DocTool.add_to_google_doc(doc_id, response_data["content"])
-                return f"Successfully added the content to {file_name}"
-                #return {"status": "success", "message": f"✅ Added content to '{file_name}'"}
-
-            # UPDATE
-            elif action == "update":
-                doc_id = self.DocTool.resolve_file_name_to_id(file_name)
-                old_text = self.DocTool.get_google_doc_content(doc_id)
-                new_text = response_data["new_text"]
-                response = self.client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Merge new content with the old one without overwriting unnecessarily."},
-                        {"role": "user", "content": f"Old:\n{old_text}"},
-                        {"role": "user", "content": f"New:\n{new_text}"}
-                    ]
-                )
-                updated_text = response.choices[0].message.content
-                self.DocTool.edit_google_doc(doc_id, updated_text)
-                return f"Successfully updated the content of {file_name}"
-                #return {"status": "success", "message": f"✏️ Updated '{file_name}'"}
-
-            # DELETE
-            elif action == "delete":
-                doc_name = self.get_doc_name(file_name)
-                doc_id = self.DocTool.resolve_file_name_to_id(doc_name)
-                self.DocTool.delete_google_doc(doc_id)
-                return f"Successfully 🗑️ Deleted the file {file_name}"
-                #return {"status": "success", "message": f"🗑️ Deleted '{file_name}'"}
-
-            # SUMMARIZE
-            elif action == "summarize":
-                doc_id = self.DocTool.resolve_file_name_to_id(file_name)
-                content = self.DocTool.get_google_doc_content(doc_id)
-                response = self.client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system", "content": "Summarize the document. Include headings and sections if possible."},
-                        {"role": "user", "content": content}
-                    ]
-                )
-                return f"Here is the 📝 summary of {file_name}:-\n{response.choices[0].message.content}"
-                return {"status": "success", "message": f"📝 Summary of '{file_name}'", "summary": response.choices[0].message.content}
-
-            return f"Error: Unknown function {action}"
-            #return {"status": "error", "message": f"Unknown action: {action}"}
+            if response == "AMBIGUOUS_MATCH":
+                 # Trigger Director interruption for user choice
+                 return f"Agent Error: AMBIGUOUS_FILE_MATCH; Target: {ambiguous_name}; Recent files: {doc_list_str}"
+            
+            # Success: Return the resolved name
+            return response
 
         except Exception as e:
-            return f"Error: Exception: {str(e)}"
-            #return {"status": "error", "message": f"⚠️ Exception: {str(e)}"}
+            logging.error(f"File ambiguity resolution failed: {e}")
+            return f"Agent Error: SYSTEM_EXECUTION_ERROR; File resolution failed: {str(e)}"
+        
+    # -------------------- NEW: Action Handlers (Replacing handle_action) --------------------
+    
+    def _get_doc_id_resolved(self, file_name: str) -> tuple[str, str]:
+        """
+        Resolves file name to ID, handling ambiguity if necessary.
+        Raises ValueError with a structured error string if resolution fails.
+        """
+        if not file_name or file_name == "MISSING_FILE_NAME":
+             # This triggers INCOMPLETE status
+             raise ValueError("Agent Error: MISSING_DATA_DOC_FILE_NAME; Target: N/A")
+
+        resolved_name_or_error = self._resolve_file_ambiguity(file_name)
+        
+        if resolved_name_or_error.startswith("Agent Error:"):
+             # Ambiguity or System Error detected during resolution
+             raise ValueError(resolved_name_or_error) # Director will catch this
+        
+        resolved_name = resolved_name_or_error
+        
+        doc_id = self.DocTool.resolve_file_name_to_id(resolved_name)
+        
+        if not doc_id:
+             # File not found after resolution
+             raise ValueError(f"Agent Error: FILE_NOT_FOUND; Target: {resolved_name}")
+             
+        return doc_id, resolved_name
+
+    # -------------------- Dedicated Action Handlers --------------------
+
+    def _handle_create(self, params: Dict) -> str:
+        file_name = params.get("file_name", "New Document")
+        content = params.get("initial_content", "")
+        
+        try:
+            doc_data = self.DocTool.create_google_doc(title=file_name, initial_content=content)
+            # Success: Return RAW status string
+            return f"RAW_STATUS: DOC_CREATED; ID: {doc_data['id']}; Title: {doc_data['title']}; Link: {doc_data['link']}"
+        except DocToolError as e:
+            return f"Agent Error: DOC_TOOL_FAILURE; Failed to create file: {e}"
+
+    def _handle_retrieve(self, params: Dict) -> str:
+        file_name = params.get("file_name")
+        
+        try:
+            doc_id, resolved_name = self._get_doc_id_resolved(file_name)
+            content = self.DocTool.get_google_doc_content(doc_id)
+            
+            # Success: Return raw content string
+            return f"RAW_DATA: DOC_CONTENT; Title: {resolved_name}; Content: {content}"
+            
+        except DocToolError as e:
+            return f"Agent Error: DOC_TOOL_FAILURE; Failed to retrieve file content: {e}"
+        except ValueError as e:
+            return str(e) # Pass through ValueError (INCOMPLETE/NOT_FOUND)
+
+    def _handle_add_text(self, params: Dict) -> str:
+        file_name = params.get("file_name")
+        content = params.get("content")
+
+        if not content:
+            return "Agent Error: MISSING_DATA_DOC_CONTENT; Action: add_text"
+        
+        try:
+            doc_id, resolved_name = self._get_doc_id_resolved(file_name)
+            location = params.get("location", "end") 
+            
+            self.DocTool.add_to_google_doc(doc_id, content, location=location)
+            
+            # Success: Return RAW status string
+            return f"RAW_STATUS: DOC_TEXT_ADDED; Title: {resolved_name}; Location: {location}"
+            
+        except DocToolError as e:
+            return f"Agent Error: DOC_TOOL_FAILURE; Failed to add text: {e}"
+        except ValueError as e:
+            return str(e)
+
+    def _handle_update(self, params: Dict) -> str:
+        file_name = params.get("file_name")
+        new_text = params.get("new_text")
+
+        if not new_text:
+            return "Agent Error: MISSING_DATA_DOC_NEW_TEXT; Action: update"
+
+        try:
+            doc_id, resolved_name = self._get_doc_id_resolved(file_name)
+            
+            # 1. Retrieve current content
+            old_text = self.DocTool.get_google_doc_content(doc_id)
+
+            # 2. Internal LLM Call: Merge content (Smart-Headless functionality)
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "You are a content merger. Integrate the 'New' content into the 'Old' document, preserving structure."},
+                    {"role": "user", "content": f"Old Document Content:\n{old_text}\nNew Content/Instructions:\n{new_text}"}
+                ]
+            )
+            updated_text = response.choices[0].message.content
+            
+            # 3. Overwrite document with merged content
+            self.DocTool.edit_google_doc(doc_id, updated_text)
+            
+            # Success: Return RAW status string
+            return f"RAW_STATUS: DOC_UPDATED; Title: {resolved_name}"
+            
+        except DocToolError as e:
+            return f"Agent Error: DOC_TOOL_FAILURE; Failed to update document: {e}"
+        except ValueError as e:
+            return str(e)
+
+    def _handle_delete(self, params: Dict) -> str:
+        file_name = params.get("file_name")
+        
+        try:
+            doc_id, resolved_name = self._get_doc_id_resolved(file_name)
+            
+            self.DocTool.delete_google_doc(doc_id)
+            
+            # Success: Return RAW status string
+            return f"RAW_STATUS: DOC_DELETED; Title: {resolved_name}"
+            
+        except DocToolError as e:
+            return f"Agent Error: DOC_TOOL_FAILURE; Failed to delete file: {e}"
+        except ValueError as e:
+            return str(e)
+
+    def _handle_summarize(self, params: Dict) -> str:
+        file_name = params.get("file_name")
+        
+        try:
+            doc_id, resolved_name = self._get_doc_id_resolved(file_name)
+            content = self.DocTool.get_google_doc_content(doc_id)
+            
+            # Internal LLM Call for summarization
+            response = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": "Summarize the document concisely. Include key points and headings if possible."},
+                    {"role": "user", "content": content}
+                ]
+            )
+            summary = response.choices[0].message.content
+            
+            # Success: Return the RAW summary string
+            return f"RAW_DATA: DOC_SUMMARY; Title: {resolved_name}; Summary: {summary}"
+            
+        except DocToolError as e:
+            return f"Agent Error: DOC_TOOL_FAILURE; Failed to summarize file: {e}"
+        except ValueError as e:
+            return str(e)
+
+    # -------------------- Main Contract Function --------------------
+
+    def handle_query(self, query: str, context: Any = None) -> Dict[str, Any]:
+        """
+        Executes the Doc task. Returns the unified structured dictionary:
+        {"status": str, "action": str, "context": Any}.
+        """
+        logging.info(f"Doc Agent received query: {query}")
+        action = "unknown"
+        
+        try:
+            # 1. Analyze the query
+            task = self._analyze_query_to_json(query)
+            action = task.get("action", "parse_fail")
+            
+            if task.get("error"):
+                 # Parser error is unrecoverable by the Agent
+                 return {"status": "FATAL_ERROR: PARSE_ERROR", "action": action, "context": f"LLM parsing failed: {task['error']}"}
+
+            # 2. Dispatch to dedicated handler
+            if action == "create":
+                response = self._handle_create(task)
+            elif action == "retrieve":
+                response = self._handle_retrieve(task)
+            elif action == "summarize":
+                response = self._handle_summarize(task)
+            elif action == "add_text":
+                response = self._handle_add_text(task)
+            elif action == "update":
+                response = self._handle_update(task)
+            elif action == "delete":
+                response = self._handle_delete(task)
+            else:
+                response = f"Agent Error: UNKNOWN_ACTION; Action '{action}' not supported."
+
+            # 3. Final Output Wrapping
+            # All successful and recoverable failure paths return a string from the handlers.
+            
+            if isinstance(response, str):
+                # Specific Recoverable Errors (INCOMPLETE status)
+                if response.startswith("Agent Error: MISSING_DATA") or response.startswith("Agent Error: AMBIGUOUS_FILE_MATCH"):
+                    return {"status": "INCOMPLETE: MISSING_DATA", "action": action, "context": response}
+                
+                # Fatal Errors
+                elif response.startswith("Agent Error: SYSTEM_EXECUTION_ERROR") or response.startswith("Agent Error: FILE_NOT_FOUND") or response.startswith("Agent Error: DOC_TOOL_FAILURE"):
+                    return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": response}
+                
+                # Successful RAW Status/Data
+                elif response.startswith("RAW_STATUS:") or response.startswith("RAW_DATA:"):
+                    return {"status": "COMPLETE: RAW_DATA", "action": action, "context": response}
+                
+                else:
+                    # Catch-all for unexpected successful strings (treat as complete raw data)
+                    return {"status": "COMPLETE: RAW_DATA", "action": action, "context": response}
+            
+            # If the response is a complex object (shouldn't happen in DocAgent but kept for safety)
+            return {"status": "COMPLETE: RAW_DATA", "action": action, "context": response}
+
+        except Exception as e:
+            # Catch any unexpected Python exceptions that bubble up
+            return {"status": "FATAL_ERROR: SYSTEM_EXECUTION", "action": action, "context": str(e)}

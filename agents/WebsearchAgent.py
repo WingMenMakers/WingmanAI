@@ -1,104 +1,68 @@
 import os
-from openai import OpenAI
+import json
+import logging
 from dotenv import load_dotenv
-from Tools.WebsearchTool import WebSearchTool
-from typing import Dict, Any
+from openai import OpenAI
 from google.oauth2.credentials import Credentials
+from Tools.WebsearchTool import WebSearchTool, WebSearchToolError
+from typing import Dict, Any
 
-# Load environment variables
 load_dotenv()
 
 class WebsearchAgent:
-    # Accept the credentials argument
+    """
+    A Headless Executor Agent for web search. 
+    Returns raw search data or structured error strings.
+    """
+    
     def __init__(self, credentials: Credentials = None): 
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.search_tool = WebSearchTool()
-        self.system_prompt = """
-        You are WingMan's Web Search Agent, designed to find and present information from the internet.
-        Your responses should be:
-        1. Accurate and based on search results
-        2. Concise but informative
-        3. Well-structured and easy to read
-        4. Include sources when relevant
-        5. Match the user's tone while maintaining professionalism
+        self.search_tool = None
         
-        When presenting information:
-        - Start with the most relevant information
-        - Use bullet points for multiple facts
-        - Include brief source citations
-        - Add emojis when appropriate for the tone
-        - Highlight key information naturally
+        try:
+             self.search_tool = WebSearchTool()
+        except WebSearchToolError as e:
+             logging.warning(f"Websearch Agent disabled: {e}")
+             self.search_tool = None
+
+    def handle_query(self, query: str, context: Any = None) -> Dict[str, Any]:
         """
+        Handles search requests and returns the unified structured dictionary.
+        {"status": str, "action": "search", "context": Any}.
+        """
+        action = "search"
+        
+        if not self.search_tool:
+            context_error = "Agent Error: TOOL_UNAVAILABLE; Web search API is not configured."
+            return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
 
-    def handle_query(self, user_query):
-        """Handle search requests and return formatted responses."""
-        try:            
-            # Perform search based on type
-            result = self.search_tool.get_quick_answer(user_query)
-            if result.get("answer"):
-                return self._format_quick_answer(result, user_query)
-            else:
-                # If quick answer fails, try detailed search
-                    result = self.search_tool.get_detailed_search(user_query)
-                    return self._format_detailed_results(result, user_query)
-                
+        try:
+            # 1. Attempt Quick Answer
+            quick_result = self.search_tool.get_quick_answer(query)
+            
+            if quick_result.get("answer"):
+                # Success: Return raw, structured quick answer data
+                context_data = f"RAW_DATA: QUICK_ANSWER; Query: {query}; Answer: {quick_result['answer']}; Source: {quick_result['source']}"
+                return {"status": "COMPLETE: RAW_DATA", "action": action, "context": context_data}
+            
+            # 2. Fall back to Detailed Search
+            detailed_result = self.search_tool.get_detailed_search(query)
+            
+            if detailed_result.get("results"):
+                # Success: Return raw, structured detailed results (JSON list/dict)
+                # This complex data needs LLM formatting by the Director.
+                return {"status": "COMPLETE: RAW_DATA", "action": action, "context": detailed_result}
+            
+            # 3. Total failure: No results found
+            context_data = f"RAW_DATA: NO_RESULTS; Query: {query}"
+            return {"status": "COMPLETE: RAW_DATA", "action": action, "context": context_data}
+            
+        except WebSearchToolError as e:
+            # Catch Tool-level API errors and return a FATAL_ERROR status
+            context_error = f"Agent Error: SEARCH_API_FAILURE; Reason: {e}"
+            return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
+            
         except Exception as e:
-            return f"Oops! Something went wrong with the search: {str(e)}"
-
-    def _format_quick_answer(self, result: Dict, query: str) -> str:
-        """Format quick answer results using GPT."""
-        if result.get("error"):
-            return f"Sorry, I couldn't find a quick answer for that. {result['error']}"
-            
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"""
-            Format this search result into a natural, direct response:
-            Query: {query}
-            Answer: {result.get('answer')}
-            Source: {result.get('source')}
-            
-            Remember to:
-            1. Answer directly and clearly
-            2. Include specific facts and numbers
-            3. Add relevant emojis
-            4. Keep it conversational
-            """}
-        ]
+            context_error = f"Agent Error: SYSTEM_EXECUTION_ERROR; Reason: {str(e)}"
+            return {"status": "FATAL_ERROR: SYSTEM_EXECUTION", "action": action, "context": context_error}
         
-        completion = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.7
-        )
-        
-        return completion.choices[0].message.content
-
-    def _format_detailed_results(self, result: Dict, query: str) -> str:
-        """Format detailed search results using GPT."""
-        if result.get("error"):
-            return f"Sorry, I couldn't complete the detailed search. {result['error']}"
-            
-        # Prepare search results for formatting
-        results_text = "\n".join([
-            f"- {r.get('title', 'Untitled')}: {r.get('snippet', 'No snippet available')}"
-            for r in result.get("results", [])[:3]
-        ])
-        
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"""
-            Create a comprehensive but concise summary from these search results:
-            Query: {query}
-            Results:
-            {results_text}
-            """}
-        ]
-        
-        completion = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages,
-            temperature=0.7
-        )
-        
-        return completion.choices[0].message.content

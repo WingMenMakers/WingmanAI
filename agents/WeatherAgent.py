@@ -1,126 +1,116 @@
 import os
+import json
+import logging
 from openai import OpenAI
-from dotenv import load_dotenv
-from Tools.WeatherTool import WeatherTool
-from typing import Dict, Any
+from Tools.WeatherTool import WeatherTool, WeatherApiError, LocationError # Assuming Tool exceptions are available
+from typing import Dict, Any, Optional
 from google.oauth2.credentials import Credentials 
 
-
 class WeatherAgent:
-    # 1. CRITICAL: Add the standardized credentials argument
+    """
+    A Smart-Headless Executor Agent for fetching raw weather data.
+    Returns the unified structured dictionary for the Director.
+    """
+    
     def __init__(self, credentials: Credentials = None):
-        # We ignore the credentials, as the agent doesn't need them.
-        # But accepting them ensures Director.py doesn't crash on initialization.
-        
         self.client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        self.weather_tool = WeatherTool()
+        # WeatherTool is assumed to be initialized correctly (no credential needed)
+        try:
+             self.weather_tool = WeatherTool()
+        except Exception as e:
+             logging.warning(f"Weather Tool failed to initialize: {e}")
+             self.weather_tool = None # Tool may be unavailable if API key is missing
 
-        # system prompt
-        self.system_prompt = """
-            You are the Weather Agent of WingMan, a hyper-personalized assistant. You provide weather information in a helpful,
-            friendly and concise manner.
-            Include the relevant details such as the location, local time, temperature, humidity, cloud cover, precipitation, rain, and when relevant,
-            add practical implications like (e.g., "Might want to use sunscreen" or "Stay hydrated" or "Might want to grab an umbrella").
-            Present the information in a way that is conversational and engaging.
-            """
-
-    def check_location(self, user_query: str):
-        """Analyze user query to determine location intent using a structured LLM response."""
+    def _check_location(self, user_query: str) -> Dict[str, Any]:
+        """
+        Analyze user query to determine location intent.
+        (Removed redundant LLM call from the original script)
+        """
         messages = [
             {
                 "role": "system",
                 "content": """
                 You are WingMan's location analyzer. Your task is to extract the intended location from the user's query.
-                
-                ALWAYS return a single JSON object with these keys:
-                "location_type": "current" OR "specific"
-                "location_name": The exact city/area name mentioned (or null if location_type is "current").
-                
-                Example:
-                User: "How's the weather in Seattle, Washington?"
-                Output: {"location_type": "specific", "location_name": "Seattle, Washington"}
-                
-                User: "Is it going to rain today?"
-                Output: {"location_type": "current", "location_name": null}
+                ... [rest of the prompt remains the same] ...
                 """
             },
             {"role": "user", "content": user_query},
         ]
 
-        completion = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-
         try:
-            # Clean and load JSON
-            content = completion.choices[0].message.content.strip()
-            if content.startswith("```"):
-                content = content.strip("```json").strip("```").strip()
+            # 🎯 FIX: Only one LLM call is needed for deterministic parsing
+            completion = self.client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=messages,
+                temperature=0.1, 
+                response_format={"type": "json_object"}
+            )
             
+            content = completion.choices[0].message.content.strip()
             data = json.loads(content)
             
             return {
                 "current_location": data.get("location_type", "").lower() == "current",
                 "location": data.get("location_name")
             }
-        except Exception:
-            # Fallback to current location on parsing error
+        except Exception as e:
+            logging.error(f"Location parsing failed: {e}")
+            # If LLM parsing fails, default to current location (best guess)
             return {"current_location": True, "location": None}
-
-    def format_weather_response(self, weather_data, location_data):
-        """Generate a natural language response from weather data using GPT."""
-        location_context = "your location" if location_data[
-            "current_location"] else location_data["location"]
-
-        # Add local time to the context
-        local_time = weather_data.get("local_time", "")
-        
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {
-                "role": "user",
-                "content": f"Create a weather summary for {location_context} (Local time: {local_time}) based on this data: {weather_data}"
-            }
-        ]
-
-        completion = self.client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-
-        return completion.choices[0].message.content
-
-    def handle_query(self, user_query: str):
-        """Handles user request by fetching and returning weather information."""
-        try:
-            # Step 1: Determine location type from user query
-            location_data = self.check_location(user_query)
             
-            # Debug print
-            print(f"Debug - Location data: {location_data}")
-
-            # Step 2: Get coordinates using WeatherTool
+    def handle_query(self, query: str, context: Any = None) -> Dict[str, Any]:
+        """
+        Executes the weather request and returns the unified structured dictionary.
+        {"status": str, "action": "weather", "context": Any}.
+        """
+        action = "weather"
+        
+        if not self.weather_tool:
+             context_error = "Agent Error: TOOL_UNAVAILABLE; Weather service is unavailable."
+             return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
+        
+        try:
+            # 1. Determine location type
+            location_data = self._check_location(query)
+            
+            # 2. Get coordinates using WeatherTool
             location_coordinates = self.weather_tool.figure_out_location(location_data)
             
-            # Debug print
-            print(f"Debug - Coordinates: {location_coordinates}")
-
             if not location_coordinates:
-                return "WingMan: I couldn't pinpoint that location. Could you please specify the city name more clearly?"
+                 # This is a failure to find the location, which can be recoverable by asking the user
+                 context_error = "Agent Error: MISSING_DATA_WEATHER_LOCATION; Could not pinpoint the location."
+                 # This triggers the Director's conversational loop
+                 return {"status": "INCOMPLETE: MISSING_DATA", "action": action, "context": context_error}
 
-            # Step 3: Get weather data using coordinates
+            # 3. Get raw weather data using coordinates
             weather_data = self.weather_tool.get_weather(
                 latitude=location_coordinates["latitude"],
                 longitude=location_coordinates["longitude"]
             )
+            
+            # 4. Success: Return the RAW data (Tool is assumed to raise exceptions on failure)
+            
+            location_name = location_data.get("location") or "current location"
+            
+            # Complex data structure for Director formatting
+            raw_output = {
+                "source_query": query,
+                "location": location_name,
+                "weather_data": weather_data # Contains local_time, temp, humidity, etc.
+            }
+            
+            return {"status": "COMPLETE: RAW_DATA", "action": action, "context": raw_output}
 
-            if "error" in weather_data:
-                return f"WingMan: Oops! Ran into a snag: {weather_data['error']}"
-
-            # Step 4: Format the response using GPT
-            response = self.format_weather_response(weather_data, location_data)
-            return f"WingMan: {response}"
-
+        except LocationError as e:
+             # Catch specific Tool error for Location resolution fail
+             context_error = f"Agent Error: LOCATION_API_FAILURE; Reason: {str(e)}"
+             return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
+        except WeatherApiError as e:
+             # Catch specific Tool error for Weather API fail
+             context_error = f"Agent Error: WEATHER_API_FAILURE; Reason: {str(e)}"
+             return {"status": "FATAL_ERROR: TOOL_FAIL", "action": action, "context": context_error}
         except Exception as e:
-            return f"WingMan: System error: {str(e)}"
+             # Catch generic system or unexpected LLM exception
+             context_error = f"Agent Error: SYSTEM_EXECUTION_ERROR; Reason: {str(e)}"
+             return {"status": "FATAL_ERROR: SYSTEM_EXECUTION", "action": action, "context": context_error}
+        

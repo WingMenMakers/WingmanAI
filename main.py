@@ -112,10 +112,15 @@ def main():
             ]
 
             # Get response from Director
-            response = director.handle_query(user_query)
+            director_output = director.handle_query(user_query)
+            response = director_output['message']
+            final_raw_result = director_output.get('raw_data')
 
             # Assistant response -> memory
-            metadata = {"agent": getattr(director, "last_used_agent", None)}
+            metadata = {
+                "agent": director_output.get("agent_key", None),
+                "raw_result": final_raw_result 
+            }
             chat_memory.add_message("assistant", response, metadata=metadata)
 
             print(f"\nWingMan: {response}\n")

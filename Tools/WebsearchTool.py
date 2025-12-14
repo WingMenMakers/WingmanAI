@@ -1,42 +1,38 @@
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 import requests
 from dotenv import load_dotenv
 import json
+import logging
 
-# Load environment variables
 load_dotenv()
+
+class WebSearchToolError(Exception):
+    """Base exception for WebSearchTool failures."""
+    pass
 
 class WebSearchTool:
     def __init__(self):
-        # 1. Load keys from JSON
         try:
             with open("config/client_secret.json", "r") as f:
                 secrets = json.load(f)
                 self.api_key = secrets.get("tavily", {}).get("api_key")
         except FileNotFoundError:
             self.api_key = None
+        except Exception as e:
+            self.api_key = None
+            logging.error(f"Error loading secrets: {e}")
             
-        # 2. Set availability based on the key
-        self.available = bool(self.api_key) 
-        if not self.available:
-            print("⚠️ WARNING: TAVILY API key missing from client_secret.json. Web search disabled.")
+        if not self.api_key:
+            # 🎯 CRITICAL FIX: Raise on missing API key. Director handles this gracefully.
+            raise WebSearchToolError("TAVILY API key missing from client_secret.json. Web search disabled.")
             
         self.base_url = "https://api.tavily.com/search"
 
-    def search(self, query: str, search_depth: str = "basic") -> Dict:
-        if not self.available:
-            return {"error": "TAVILY_API_KEY is not configured.", "results": []}
-        
+    def search(self, query: str, search_depth: str = "basic") -> Dict[str, Any]:
         """
-        Perform a web search using Tavily API.
-        
-        Args:
-            query (str): Search query
-            search_depth (str): 'basic' or 'deep' search (affects response time and detail)
-        
-        Returns:
-            Dict containing search results and metadata
+        Perform a web search using Tavily API. 
+        Returns raw response dict, raises WebSearchToolError on failure.
         """
         try:
             headers = {
@@ -53,111 +49,49 @@ class WebSearchTool:
                 "api_key": self.api_key
             }
             
-            response = requests.post(
-                self.base_url,
-                headers=headers,
-                json=data
-            )
+            response = requests.post(self.base_url, headers=headers, json=data, timeout=15)
             
-            print(f"Debug - API response status: {response.status_code}")
-            print(f"Debug - Response headers: {dict(response.headers)}")
+            # Raise exceptions for 4xx/5xx status codes
+            response.raise_for_status() 
             
-            if response.status_code != 200:
-                print(f"Debug - Error response body: {response.text}")
-                
-            response.raise_for_status()
-            result = response.json()
-            
-            if result.get("answer"):
-                print(f"Debug - Search result: {result['answer'][:100]}...")
-            else:
-                print("Debug - No direct answer in response")
-            
-            return result
+            return response.json()
             
         except requests.exceptions.RequestException as e:
-            print(f"Search error: {str(e)}")
-            if hasattr(e.response, 'text'):
-                print(f"Error response: {e.response.text}")
-            return {
-                "error": f"Search failed: {str(e)}",
-                "results": []
-            }
+            # Catch API/Network errors and re-raise as our custom error
+            error_msg = f"API request failed with status {e.response.status_code if e.response else 'N/A'}"
+            logging.error(f"Tavily API error: {error_msg}. Response: {e.response.text if e.response else 'None'}")
+            raise WebSearchToolError(error_msg)
         except Exception as e:
-            print(f"Unexpected error: {str(e)}")
-            return {
-                "error": f"Unexpected error: {str(e)}",
-                "results": []
-            }
+            raise WebSearchToolError(f"Unexpected search error: {str(e)}")
 
-    def get_quick_answer(self, query: str) -> Dict:
-        """
-        Get a quick answer for simple queries.
+    def get_quick_answer(self, query: str) -> Dict[str, Any]:
+        """Get a quick answer using basic search. Returns structured dict."""
+        result = self.search(query, search_depth="basic")
         
-        Args:
-            query (str): Search query
+        # Consolidate answer extraction
+        answer = result.get("answer")
+        source = result.get("results", [{}])[0].get("url", "Unknown source")
         
-        Returns:
-            Dict containing the answer and source
-        """
-        try:
-            result = self.search(query, search_depth="basic")
-            
-            if "answer" in result and result["answer"]:
-                return {
-                    "answer": result["answer"],
-                    "source": result.get("results", [{}])[0].get("url", "Unknown source")
-                }
-            
-            if result.get("results"):
-                first_result = result["results"][0]
-                return {
-                    "answer": first_result.get("snippet", "No direct answer available"),
-                    "source": first_result.get("url", "Unknown source")
-                }
-            
-            return {
-                "answer": None,
-                "source": None,
-                "error": "No quick answer available"
-            }
-            
-        except Exception as e:
-            print(f"Quick answer error: {str(e)}")
-            return {
-                "answer": None,
-                "source": None,
-                "error": f"Quick answer failed: {str(e)}"
-            }
+        if answer:
+            return {"answer": answer, "source": source}
+        
+        # If no direct answer, return the snippet of the first result as the answer
+        snippet_answer = result.get("results", [{}])[0].get("snippet")
+        if snippet_answer:
+            return {"answer": snippet_answer, "source": source}
 
-    def get_detailed_search(self, query: str) -> Dict:
-        """
-        Perform a detailed search for complex queries.
+        # If still nothing, let the Agent handle the lack of data
+        return {"answer": None, "source": None}
+
+    def get_detailed_search(self, query: str) -> Dict[str, Any]:
+        """Perform a detailed search for complex queries. Returns structured dict."""
+        result = self.search(query, search_depth="deep")
         
-        Args:
-            query (str): Search query
-        
-        Returns:
-            Dict containing detailed search results
-        """
-        try:
-            result = self.search(query, search_depth="deep")
-            
-            if "results" in result and result["results"]:
-                return {
-                    "results": result["results"],
-                    "answer": result.get("answer"),
-                    "topic": query
-                }
-            
+        if result.get("results"):
             return {
-                "error": "No results found",
-                "results": []
+                "results": result["results"], # Raw list of result dicts
+                "answer": result.get("answer"),
+                "query": query
             }
-            
-        except Exception as e:
-            print(f"Detailed search error: {str(e)}")
-            return {
-                "error": f"Detailed search failed: {str(e)}",
-                "results": []
-            } 
+        
+        return {"results": [], "answer": None, "query": query}
