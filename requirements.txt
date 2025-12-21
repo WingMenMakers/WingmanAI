@@ -1,0 +1,11 @@
+fastapi 
+uvicorn 
+pydantic 
+python-multipart 
+python-jose[cryptography] 
+google-auth-oauthlib
+selenium
+webdriver_manager
+pydantic_settings
+pydantic[email]
+google-cloud-firestore
