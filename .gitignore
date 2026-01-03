@@ -1,4 +1,5 @@
 .env
-.config/
+config/
 __pycache__/
 *.json
+commands.txt

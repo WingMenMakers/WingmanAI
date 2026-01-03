@@ -31,7 +31,13 @@ class Director:
         "Linkedin": ["w_member_social", "profile", "email"], 
     }
 
-    def __init__(self, user_email, chat_memory_instance):
+    def __init__(
+        self, 
+        user_email: str, 
+        chat_memory_instance=None, # Keep this flexible
+        google_credentials=None,    # ADD THIS
+        **kwargs
+    ):
         self.user_email = user_email
         # REFACTOR: Use settings for API Key
         self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
@@ -40,7 +46,7 @@ class Director:
         self.chat_memory = chat_memory_instance
         
         self.agents = {}
-        self.google_credentials = None
+        self.google_credentials = google_credentials
         self.linkedin_tokens = None
         self.user_scopes = set()
 
@@ -54,11 +60,16 @@ class Director:
         self.system_prompt_base = self._generate_dynamic_system_prompt()
 
     def _initialize_auth(self):
-        try:
-            self.google_credentials = load_google_credentials(self.user_email)
+        # Only load from Firestore if they weren't passed in via __init__
+        if not self.google_credentials:
+            try:
+                self.google_credentials = load_google_credentials(self.user_email)
+            except ValueError:
+                logging.info(f"Google services not available for {self.user_email}.")
+        
+        # Set the scopes from the credentials we now have
+        if self.google_credentials:
             self.user_scopes = set(self.google_credentials.scopes)
-        except ValueError:
-            logging.info(f"Google services not available for {self.user_email}.")
             
         try:
             self.linkedin_tokens = load_linkedin_tokens(self.user_email)

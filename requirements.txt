@@ -9,3 +9,6 @@ webdriver_manager
 pydantic_settings
 pydantic[email]
 google-cloud-firestore
+authlib 
+itsdangerous
+starlette

@@ -5,8 +5,6 @@ from pydantic import Field
 import os
 from typing import Optional
 
-# Ensure python-dotenv is installed: pip install python-dotenv pydantic-settings
-
 class Settings(BaseSettings):
     """
     Application settings loaded from environment variables and .env file.
@@ -17,21 +15,27 @@ class Settings(BaseSettings):
     APP_NAME: str = "WingMan FastAPI"
     APP_VERSION: str = "1.0.0"
     
+    # 🎯 NEW: Required for SessionMiddleware (encrypts cookies)
+    SECRET_KEY: str = Field(..., description="Secret key for signing session cookies.")
+    
     # --- External API Keys (.env) ---
     OPENAI_API_KEY: str = Field(..., description="API key for OpenAI calls.")
     TAVILY_API_KEY: Optional[str] = Field(None, description="API key for the Websearch Agent (Tavily).")
     
+    # --- Google OAuth Settings (.env) ---
+    # 🎯 NEW: Required for the /login/google flow
+    GOOGLE_CLIENT_ID: str = Field(..., description="Google OAuth Client ID.")
+    GOOGLE_CLIENT_SECRET: str = Field(..., description="Google OAuth Client Secret.")
+    
     # --- Google/Firebase Settings (.env) ---
-    # This is set for the FirestoreMemory service account (for production)
-    # The value is usually the path to the service account JSON key.
-    GOOGLE_APPLICATION_CREDENTIALS: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    # Path to service_account.json for Firestore access
+    GOOGLE_APPLICATION_CREDENTIALS: str = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "config/service_account.json")
 
-    # --- Local File Paths (Relative to token_manager or Director) ---
-    # NOTE: These paths must be correct relative to the calling script (token_manager.py)
-    # We define them here for central access, but the OS file calls remain local to the token manager.
+    # --- Local File Paths ---
+    # We keep these for now, but as we move to Firestore, these will eventually become obsolete
     USERS_FILE_PATH: str = "data/users.json"
-    CLIENT_SECRET_PATH: str = ".config/client_secret.json"
-    SCOPES_FILE_PATH: str = ".config/scopes.json"
+    CLIENT_SECRET_PATH: str = "config/client_secret.json"
+    SCOPES_FILE_PATH: str = "config/scopes.json"
 
 # Create a singleton settings instance
 settings = Settings()

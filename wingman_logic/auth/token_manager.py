@@ -1,158 +1,92 @@
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-import json
-from google.cloud import firestore
-import os
-from datetime import datetime, timedelta
-from typing import Dict, Any, List, Optional
+# wingman_logic/auth/token_manager.py
+
 import logging
+from typing import Dict, Any, List, Optional
+from google.cloud import firestore
+from google.oauth2.credentials import Credentials
 from app.core.config import settings
+from google.auth.transport.requests import Request as GoogleRequest
 
-def _load_all_users() -> List[Dict]:
-    """Loads the entire user list from users.json."""
-    if os.path.exists(settings.USERS_FILE_PATH): 
-        try:
-            with open(settings.USERS_FILE_PATH, "r") as f:
-                return json.load(f)
-        except json.JSONDecodeError:
-            logging.error("Error decoding users.json. File may be corrupted.")
-            return []
-    return []
-
-def _save_all_users(users: List[Dict]):
-    """Saves the entire user list back to users.json."""
-    try:
-        # REFACTOR: Use settings path
-        with open(settings.USERS_FILE_PATH, "w") as f: 
-            json.dump(users, f, indent=2)
-    except Exception as e:
-        logging.error(f"Error saving users.json: {e}")
-
-# --- Core Token Management ---
+# Initialize Firestore Client
+# Ensure "config/service_account.json" is the path to your Google Cloud Key
+db = firestore.Client.from_service_account_json("config/service_account.json")
 
 def save_credentials(email: str, service: str, data: Dict[str, Any]):
-    """Saves or updates a user's credentials for a specific service."""
+    """Saves or updates a user's credentials for a specific service in Firestore."""
+    user_key = email.lower()
+    doc_ref = db.collection("wingman_users").document(user_key)
     
-    users = _load_all_users()
-    
-    # Find user or create new entry
-    user_found = False
-    for i, user in enumerate(users):
-        if user["email"] == email:
-            # Update existing user
-            if "services" not in user:
-                user["services"] = {}
-            user["services"][service] = data
-            users[i] = user
-            user_found = True
-            break
-    
-    if not user_found:
-        # Create new user entry
-        new_user = {
-            "email": email,
-            "services": {service: data}
+    # We use 'merge=True' so we don't overwrite other services (like LinkedIn) 
+    # when saving Google creds.
+    doc_ref.set({
+        "email": user_key,
+        "services": {
+            service: data
         }
-        users.append(new_user)
+    }, merge=True)
     
-    _save_all_users(users)
-    logging.info(f"✅ Credentials for service '{service}' saved/updated for {email}.")
+    logging.info(f"✅ Credentials for '{service}' saved to Firestore for {email}.")
 
+def load_google_credentials(user_email: str) -> Credentials:
+    user_key = user_email.lower()
+    # 1. Check if the collection name matches exactly what you used in save_credentials
+    doc = db.collection("wingman_users").document(user_key).get()
 
-def load_google_credentials(email: str) -> Credentials:
-    """
-    Loads Google credentials, performs refresh if necessary, and returns a 
-    google.oauth2.credentials.Credentials object.
-    """
-    users = _load_all_users()
-    
-    user = next((u for u in users if u["email"] == email), None)
-    if not user:
-        raise ValueError(f"User {email} not found in user database.")
-    
-    # 1. Check for the 'google' service token data
-    google_data = user.get("services", {}).get("google")
-    if not google_data or not google_data.get("refresh_token"):
-        raise ValueError(f"Google credentials not found for {email}.")
-
-    # 2. Load OAuth client details from client_secret.json (needed for refresh)
-    try:
-        # REFACTOR: Use settings path
-        with open(settings.CLIENT_SECRET_PATH, "r") as f:
-            full_secrets = json.load(f) # Load the file ONCE
+    if doc.exists:
+        data = doc.to_dict()
+        # 2. Your save_credentials puts it inside a "services" -> "google" map
+        services = data.get("services", {})
+        google_data = services.get("google")
         
-        # CRITICAL FIX: Check for the required keys in the loaded object
-        client_data = full_secrets.get("installed") or full_secrets.get("web")
-
-        if not client_data:
-            raise KeyError("Google client secrets not found under 'installed' or 'web' key.")
-            
-    except FileNotFoundError:
-        raise FileNotFoundError(f"{settings.CLIENT_SECRET_PATH} not found, cannot refresh token.")
-    except KeyError as e:
-        raise KeyError(f"Client secret structure error during refresh: {e}") 
-        
-    # 3. Create Credentials object
-    creds = Credentials(
-        token=google_data.get("access_token"),
-        refresh_token=google_data.get("refresh_token"),
-        token_uri=client_data["token_uri"],
-        client_id=client_data["client_id"],
-        client_secret=client_data["client_secret"],
-        scopes=google_data.get("scopes", [])
-    )
-
-    # 4. Refresh token if expired
-    if creds.expired and creds.refresh_token:
-        try:
-            creds.refresh(Request())
-            
-            # 5. Save the refreshed token data back to users.json
-            google_data["access_token"] = creds.token
-            google_data["expiry"] = creds.expiry.isoformat()
-            
-            _save_all_users(users)
-            logging.info(f"🔄 Google token refreshed and saved for {email}.")
-        except Exception as e:
-            logging.error(f"❌ Failed to refresh Google token for {email}: {e}")
-            raise RuntimeError("Failed to refresh Google credentials. Please re-run login.py.")
+        if google_data:
+            # This converts the dict back into a Google Auth object
+            return Credentials.from_authorized_user_info(google_data)
     
-    return creds
+    # If it reaches here, it raises the error you saw
+    raise ValueError(f"No Google credentials found")
 
 def load_linkedin_tokens(email: str) -> Dict[str, Any]:
-    """
-    Loads LinkedIn token data, checks expiration if possible (optional), 
-    and returns the raw dictionary.
-    """
-    users = _load_all_users()
+    """Loads LinkedIn token data from Firestore."""
+    user_key = email.lower()
+    doc = db.collection("wingman_users").document(user_key).get()
     
-    user = next((u for u in users if u["email"] == email), None)
-    if not user:
-        raise ValueError(f"User {email} not found in user database.")
+    if not doc.exists:
+        raise ValueError(f"User {email} not found in Firestore.")
     
-    linkedin_data = user.get("services", {}).get("linkedin")
-    
-    if not linkedin_data or not linkedin_data.get("access_token"):
-        raise ValueError(f"LinkedIn tokens not found for {email}.")
+    linkedin_data = doc.to_dict().get("services", {}).get("linkedin")
+    if not linkedin_data:
+        raise ValueError(f"LinkedIn tokens not found in Firestore for {email}.")
         
-    # NOTE: LinkedIn's token refresh flow is often complex/manual. 
-    # For now, we rely on the access token and assume it is good until expired_in runs out, 
-    # but actual refresh logic should be handled by a dedicated function later if necessary.
-    
     return linkedin_data
 
-# --- Deprecated/Legacy Functions (for clean-up later) ---
-
-def load_user_credentials(email):
-    """(DEPRECATED) Legacy function now calling load_google_credentials."""
-    return load_google_credentials(email) 
-
 def has_scope(user_email, required_scope):
-    """Checks if a user has authorized a specific Google scope."""
-    users = _load_all_users()
-    user = next((u for u in users if u["email"] == user_email), None)
-    if not user:
-        return False
+    """Checks if a user has authorized a specific Google scope via Firestore."""
+    try:
+        user_key = user_email.lower()
+        doc = db.collection("wingman_users").document(user_key).get()
+        if not doc.exists: return False
         
-    google_data = user.get("services", {}).get("google", {})
-    return required_scope in google_data.get("scopes", [])
+        google_data = doc.to_dict().get("services", {}).get("google", {})
+        return required_scope in google_data.get("scopes", [])
+    except Exception:
+        return False
+
+def refresh_and_save_if_expired(user_email: str, creds: Credentials):
+    """Checks if token is expired, refreshes it, and saves the new one back to Firestore."""
+    if creds.expired and creds.refresh_token:
+        logging.info(f"🔄 Token expired for {user_email}. Refreshing...")
+        creds.refresh(GoogleRequest())
+        
+        # Convert back to dict to save
+        updated_data = {
+            "token": creds.token,
+            "refresh_token": creds.refresh_token,
+            "token_uri": creds.token_uri,
+            "client_id": creds.client_id,
+            "client_secret": creds.client_secret,
+            "scopes": creds.scopes
+        }
+        # Save back to Firestore so the NEXT session uses the new token
+        save_credentials(user_email, "google", updated_data)
+        logging.info(f"✅ Refreshed token saved for {user_email}")
+    return creds

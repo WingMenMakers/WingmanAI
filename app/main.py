@@ -13,7 +13,16 @@ from app.schemas.data_contracts import User, QueryRequest, DirectorResponse
 from app.dependencies.auth import get_current_user
 from app.dependencies.sessions import get_director_for_user
 # Import the Director Orchestrator class
-from wingman_logic.director import Director 
+from wingman_logic.director import Director
+
+from app.core.config import settings
+
+from authlib.integrations.starlette_client import OAuth
+from starlette.middleware.sessions import SessionMiddleware
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+from starlette.requests import Request
+from fastapi.responses import RedirectResponse
+from wingman_logic.auth.token_manager import save_credentials
 
 # --- Logging Configuration (Replicated from old main.py) ---
 logging.basicConfig(
@@ -29,6 +38,10 @@ app = FastAPI(
     version="1.0.0"
 )
 
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
+
+app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY, max_age=1209600)
+
 # 1. CORS Middleware Setup
 # IMPORTANT: Adjust 'allow_origins' to your actual frontend URL in production!
 app.add_middleware(
@@ -41,10 +54,69 @@ app.add_middleware(
 
 # --- API Routes ---
 
+# 2. Configure Google OAuth
+oauth = OAuth()
+oauth.register(
+    name='google',
+    client_id=settings.GOOGLE_CLIENT_ID,
+    client_secret=settings.GOOGLE_CLIENT_SECRET,
+    server_metadata_url='https://accounts.google.com/.well-known/openid-configuration',
+    client_kwargs={
+        'scope': 'openid email profile https://mail.google.com/ https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/documents https://www.googleapis.com/auth/drive'
+    }
+)
+
+@app.get("/login/google")
+async def login_google(request: Request):
+    # This forces the generated URL to use 'https' instead of 'http'
+    redirect_uri = request.url_for('auth_callback')
+    if "ngrok-free.app" in str(redirect_uri):
+        redirect_uri = str(redirect_uri).replace("http://", "https://")
+    
+    return await oauth.google.authorize_redirect(
+        request, 
+        str(redirect_uri), 
+        access_type='offline', 
+        prompt='consent'
+    )
+
+@app.get("/auth/callback")
+async def auth_callback(request: Request):
+    token = await oauth.google.authorize_access_token(request)
+    user_info = token.get('userinfo')
+    
+    if user_info:
+        user_email = user_info['email'].lower()
+        
+        # Explicitly structure the data to ensure Firestore likes it
+        creds_to_save = {
+            "token": token.get("access_token"),
+            "refresh_token": token.get("refresh_token"),
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "client_id": settings.GOOGLE_CLIENT_ID,
+            "client_secret": settings.GOOGLE_CLIENT_SECRET,
+            "scopes": token.get("scope", "").split(" ")
+        }
+        
+        save_credentials(user_email, "google", creds_to_save)
+        request.session['user_email'] = user_email
+        return {"status": "Success", "message": "Account linked and tokens saved!"}
+    
+    return RedirectResponse(url='/login-failed')
+
 @app.get("/", tags=["Health"])
 async def root():
     """Health check endpoint."""
     return {"message": "WingMan API is operational."}
+
+@app.get("/me")
+async def check_me(user: Annotated[User, Depends(get_current_user)]):
+    """Tell me who is currently logged in based on the session cookie."""
+    return {
+        "status": "Logged In",
+        "email": user.email,
+        "name": user.name
+    }
 
 @app.post(
     "/query", 
