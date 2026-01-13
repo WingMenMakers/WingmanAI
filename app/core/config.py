@@ -4,6 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 import os
 from typing import Optional
+from google.cloud import firestore
 
 class Settings(BaseSettings):
     """
@@ -39,3 +40,5 @@ class Settings(BaseSettings):
 
 # Create a singleton settings instance
 settings = Settings()
+
+db = firestore.Client.from_service_account_json(settings.GOOGLE_APPLICATION_CREDENTIALS)

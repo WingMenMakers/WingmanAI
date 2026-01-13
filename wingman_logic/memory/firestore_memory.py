@@ -1,75 +1,79 @@
 import logging
-from datetime import datetime
 from typing import Dict, Any, List, Optional
 from google.cloud import firestore
+from app.core.config import db
 
 class FirestoreMemory:
     def __init__(self, user_email: str):
-        # Path to your service account key
-        self.db = firestore.Client.from_service_account_json("config/service_account.json")
         self.user_email = user_email.lower()
-        # Document reference for the user
-        self.user_doc = self.db.collection("wingman_users").document(self.user_email)
+        # Path: wingman_users / {email} / history / {timestamp}
+        self.history_ref = db.collection("wingman_users").document(self.user_email).collection("history")
 
     def add_user_message(self, content: str):
-        """Adds a user message to the 'history' sub-collection."""
-        self.user_doc.collection("history").add({
-            "timestamp": firestore.SERVER_TIMESTAMP,
+        """Saves the user's query to Firestore."""
+        self.history_ref.add({
             "role": "user",
-            "agent_name": "User",
             "content": content,
-            "trace": []
+            "timestamp": firestore.SERVER_TIMESTAMP
         })
 
-    def add_assistant_message(self, content: str, agent_name: str, trace: List[Dict]):
-        """Adds the Director's response and execution trace to Firestore."""
-        self.user_doc.collection("history").add({
-            "timestamp": firestore.SERVER_TIMESTAMP,
+    def add_assistant_message(self, content: str, agent_name: str = "Director", trace: list = None):
+        """Saves the AI's response and the technical trace to Firestore."""
+        self.history_ref.add({
             "role": "assistant",
-            "agent_name": agent_name,
+            "agent": agent_name,
             "content": content,
-            "trace": trace,
-            "metadata": {}
+            "trace": trace or [], # This stores exactly what the agents did
+            "timestamp": firestore.SERVER_TIMESTAMP
         })
 
-    def get_focused_context(self, agent_filter: str = None, limit: int = 5) -> str:
-        """Fetches the last N turns and formats them for the LLM."""
-        history_ref = self.user_doc.collection("history")
-        # Order by time descending to get the most recent messages
-        query = history_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit)
+    def get_focused_context(self, limit: int = 10, agent_filter: str = None) -> str:
+        """Fetches recent history to give the AI context."""
+        query = self.history_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit)
+        docs = query.stream()
         
-        relevant_turns = []
-        # Firestore query results are returned as a stream
-        for doc in query.stream():
-            msg = doc.to_dict()
-            # We use the same formatting logic you wrote in Chat_Memory.py
-            relevant_turns.append(self._format_turn_for_llm(msg, agent_filter))
+        history_lines = []
+        # We reverse them to get chronological order for the LLM
+        for doc in reversed(list(docs)):
+            data = doc.to_dict()
+            role = data.get("role", "user")
+            content = data.get("content", "")
+            history_lines.append(f"{role.upper()}: {content}")
         
-        # We reverse them because we queried the newest first, 
-        # but LLMs need chronological order.
-        return "\n\n".join(reversed(relevant_turns))
+        return "\n".join(history_lines)
 
-    def get_last_trace_item(self) -> Optional[Any]:
-        """Retrieves the result of the very last successful agent action."""
-        history_ref = self.user_doc.collection("history")
-        # Get the most recent assistant message that has a trace
-        query = history_ref.where("role", "==", "assistant").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(1)
-        
-        for doc in query.stream():
-            msg = doc.to_dict()
-            if msg.get("trace"):
-                return msg["trace"][-1].get("result")
-        return None
+    def get_last_trace_item(self) -> list:
+        """Helper for follow-up queries (The index you just built is for this!)"""
+        query = self.history_ref.where("role", "==", "assistant").order_by("timestamp", direction=firestore.Query.DESCENDING).limit(1)
+        docs = list(query.stream())
+        if docs:
+            return docs[0].to_dict().get("trace", [])
+        return []
+    
+    def get_all_history(self, limit: int = 50) -> list:
+        """
+        Retrieves a chronological list of chat messages for the UI.
+        The 'random letters' you saw are Firestore Document IDs; 
+        we ignore those and just pull the 'content' and 'role' inside.
+        """
+        try:
+            # We order by timestamp so the conversation makes sense (oldest to newest)
+            query = self.history_ref.order_by("timestamp", direction=firestore.Query.DESCENDING).limit(limit)
+            docs = query.stream()
 
-    def _format_turn_for_llm(self, message: Dict, highlight_agent: str = None) -> str:
-        # (Same logic from your Chat_Memory.py - parses JSON into a text string)
-        role = message["role"].upper()
-        content = message["content"]
-        if role == "USER": return f"USER: {content}"
-        
-        trace_summary = ""
-        if message.get("trace"):
-            trace_items = [f"[{t.get('agent')}]: {str(t.get('result'))[:100]}" for t in message["trace"]]
-            trace_summary = " | ".join(trace_items)
-        
-        return f"ASSISTANT (Trace): {trace_summary}\nResponse: {content}" if trace_summary else f"ASSISTANT: {content}"
+            history = []
+            for doc in docs:
+                data = doc.to_dict()
+                
+                # We extract only what the UI needs to stay clean
+                history.append({
+                    "role": data.get("role"),      # 'user' or 'assistant'
+                    "content": data.get("content"), # The actual text
+                    "agent": data.get("agent"),     # Which agent responded (if assistant)
+                    "timestamp": data.get("timestamp").isoformat() if data.get("timestamp") else None
+                })
+            
+            return history
+        except Exception as e:
+            logging.error(f"Error retrieving history for {self.user_email}: {e}")
+            return []

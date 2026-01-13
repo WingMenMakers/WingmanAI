@@ -252,8 +252,11 @@ class Director:
                 final_message = context_data.get("message") or self._format_raw_output_via_llm(context_data.get("raw_data"), user_query)
 
         # 💾 Persistence
-        self.chat_memory.add_assistant_message(content=final_message, agent_name=last_agent, trace=current_trace)
-
+        self.chat_memory.add_assistant_message(
+        content=final_message, 
+        agent_name=last_agent, 
+        trace=current_trace # This is what allows follow-ups like "read that email"
+    )
         return {"message": final_message, "agent_key": last_agent}
 
     # -------------------- Utilities --------------------

@@ -23,6 +23,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 from starlette.requests import Request
 from fastapi.responses import RedirectResponse
 from wingman_logic.auth.token_manager import save_credentials
+from wingman_logic.memory.firestore_memory import FirestoreMemory
 
 # --- Logging Configuration (Replicated from old main.py) ---
 logging.basicConfig(
@@ -164,6 +165,21 @@ async def process_query(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"An unexpected error occurred during query processing: {str(e)}",
         )
+
+@app.get("/history", tags=["User Data"])
+async def get_chat_history(
+    user: Annotated[User, Depends(get_current_user)],
+    limit: int = 20
+):
+    """Retrieves the last N messages for the logged-in user."""
+    memory = FirestoreMemory(user_email=user.email)
+    # This calls a method we'll ensure is in your FirestoreMemory class
+    return memory.get_all_history(limit=limit)
+
+@app.get("/logout")
+async def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(url="/")
 
 # --- How to Run ---
 # 1. Install dependencies: pip install fastapi uvicorn pydantic python-multipart python-jose[cryptography] google-auth-oauthlib

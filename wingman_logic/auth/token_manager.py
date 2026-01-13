@@ -2,14 +2,10 @@
 
 import logging
 from typing import Dict, Any, List, Optional
-from google.cloud import firestore
 from google.oauth2.credentials import Credentials
 from app.core.config import settings
 from google.auth.transport.requests import Request as GoogleRequest
-
-# Initialize Firestore Client
-# Ensure "config/service_account.json" is the path to your Google Cloud Key
-db = firestore.Client.from_service_account_json("config/service_account.json")
+from app.core.config import db
 
 def save_credentials(email: str, service: str, data: Dict[str, Any]):
     """Saves or updates a user's credentials for a specific service in Firestore."""

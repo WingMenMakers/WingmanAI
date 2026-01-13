@@ -9,7 +9,7 @@ from wingman_logic.director import Director
 from wingman_logic.memory.firestore_memory import FirestoreMemory
 from app.dependencies.auth import get_current_user 
 # Use your existing function!
-from wingman_logic.auth.token_manager import load_google_credentials
+from wingman_logic.auth.token_manager import load_google_credentials, refresh_and_save_if_expired
 
 def get_director_for_user(user: Annotated[User, Depends(get_current_user)]) -> Director:
     user_key = user.email.lower()
