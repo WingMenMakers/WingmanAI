@@ -41,13 +41,17 @@ app = FastAPI(
 
 app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
-app.add_middleware(SessionMiddleware, secret_key=settings.SECRET_KEY, max_age=1209600)
+app.add_middleware(SessionMiddleware,
+                   secret_key=settings.SECRET_KEY,
+                   max_age=1209600,
+                   same_site="lax",   # IMPORTANT
+                   https_only=False)   # since localhost)
 
 # 1. CORS Middleware Setup
 # IMPORTANT: Adjust 'allow_origins' to your actual frontend URL in production!
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins for development
+    allow_origins=["http://localhost:5173"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -101,7 +105,8 @@ async def auth_callback(request: Request):
         
         save_credentials(user_email, "google", creds_to_save)
         request.session['user_email'] = user_email
-        return {"status": "Success", "message": "Account linked and tokens saved!"}
+        return RedirectResponse(url=settings.FRONTEND_URL + "/chat")
+
     
     return RedirectResponse(url='/login-failed')
 

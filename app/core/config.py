@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     USERS_FILE_PATH: str = "data/users.json"
     CLIENT_SECRET_PATH: str = "config/client_secret.json"
     SCOPES_FILE_PATH: str = "config/scopes.json"
+    FRONTEND_URL: str = Field("http://localhost:5173", description="Frontend application URL for redirects.")
 
 # Create a singleton settings instance
 settings = Settings()
