@@ -12,3 +12,4 @@ google-cloud-firestore
 authlib 
 itsdangerous
 starlette
+openai
