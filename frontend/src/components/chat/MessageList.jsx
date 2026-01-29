@@ -1,7 +1,7 @@
 import { useEffect, useRef } from "react";
 import MessageBubble from "./MessageBubble";
 
-export default function MessageList({ messages }) {
+export default function MessageList({ messages, onOpenMail }) { // 1. Receive it here
     const bottomRef = useRef(null);
 
     useEffect(() => {
@@ -9,16 +9,16 @@ export default function MessageList({ messages }) {
     }, [messages]);
 
     return (
-        <div className="space-y-4">
-            {messages.map((msg, id) => (
+        <div className="flex flex-col gap-2">
+            {messages.map((msg) => (
                 <MessageBubble
-                    key={id}
+                    key={msg.id || `${msg.role}-${msg.content}`}
                     role={msg.role}
                     content={msg.content}
+                    agent={msg.agent}
+                    onOpenMail={onOpenMail} // 2. Pass it here
                 />
             ))}
-
-            {/* Scroll anchor */}
             <div ref={bottomRef} />
         </div>
     );

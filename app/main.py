@@ -181,6 +181,12 @@ async def get_chat_history(
     # This calls a method we'll ensure is in your FirestoreMemory class
     return memory.get_all_history(limit=limit)
 
+
+# # Example FastAPI route
+# @app.get("/api/email-detail/{email_id}")
+# async def get_email_detail(email_id: str):
+#     # Your logic to fetch the full body
+
 @app.get("/logout")
 async def logout(request: Request):
     request.session.clear()
